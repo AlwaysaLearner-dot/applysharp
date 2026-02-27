@@ -1,0 +1,82 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Serif+Display:ital@0;1&family=JetBrains+Mono:wght@400;500&family=Sora:wght@300;400;500;600&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --gold: #e8b44a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  background-color: #080c10;
+  color: #c8d8e8;
+  font-family: 'Sora', sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #0f1419; }
+::-webkit-scrollbar-thumb { background: #1e2938; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #e8b44a44; }
+
+/* Selection */
+::selection { background: #e8b44a33; color: #e8f0f8; }
+
+/* Shimmer loading effect */
+.shimmer {
+  background: linear-gradient(90deg, #161d26 25%, #1e2938 50%, #161d26 75%);
+  background-size: 200% 100%;
+  animation: shimmer 1.8s linear infinite;
+}
+
+/* File drop zone */
+.drop-zone {
+  transition: all 0.2s ease;
+}
+.drop-zone:hover, .drop-zone.active {
+  border-color: #e8b44a !important;
+  background: #e8b44a08 !important;
+}
+
+/* Custom checkbox */
+input[type="file"] { display: none; }
+
+/* Textarea */
+textarea {
+  resize: vertical;
+  min-height: 120px;
+}
+
+/* Stage dots animation */
+.stage-dot {
+  transition: all 0.3s ease;
+}
+
+/* Output section tabs */
+.tab-active {
+  border-bottom: 2px solid #e8b44a;
+  color: #e8b44a;
+}
+
+/* Pulse ring */
+@keyframes ping-slow {
+  0% { transform: scale(1); opacity: 0.8; }
+  100% { transform: scale(2); opacity: 0; }
+}
+.ping-slow { animation: ping-slow 2s ease-out infinite; }
+
+/* Fade up stagger */
+.stagger-1 { animation-delay: 0.1s; }
+.stagger-2 { animation-delay: 0.2s; }
+.stagger-3 { animation-delay: 0.3s; }
+.stagger-4 { animation-delay: 0.4s; }
