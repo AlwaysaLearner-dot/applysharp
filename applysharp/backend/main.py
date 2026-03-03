@@ -1,10 +1,13 @@
 """
 CV Optimizer Backend — FastAPI
-Fixed: CORS, model name, lazy API init, better error handling
+AI: Google Gemini (free tier)
+Security: Rate limiting, CORS, input validation, session-based, auto-delete
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
+import google.generativeai as genai
+from tavily import TavilyClient
 import pdfplumber
 import io
 import os
@@ -14,15 +17,12 @@ import json
 import re
 from collections import defaultdict
 from typing import Optional
-from anthropic import Anthropic
-from tavily import TavilyClient
 
 # ─────────────────────────────────────────────
 # APP SETUP
 # ─────────────────────────────────────────────
 app = FastAPI(docs_url=None, redoc_url=None)
 
-# CORS — open during setup, locks down once working
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -36,10 +36,10 @@ app.add_middleware(
 # ─────────────────────────────────────────────
 request_log: dict = defaultdict(list)
 
-MAX_PER_HOUR    = 3
-MAX_PER_DAY     = 8
-MAX_FILE_SIZE   = 5 * 1024 * 1024
-MAX_JD_LENGTH   = 8000
+MAX_PER_HOUR     = 3
+MAX_PER_DAY      = 8
+MAX_FILE_SIZE    = 5 * 1024 * 1024
+MAX_JD_LENGTH    = 8000
 MAX_FIELD_LENGTH = 300
 
 APP_PASSWORD = os.getenv("APP_PASSWORD", "changeme")
@@ -73,7 +73,7 @@ def sanitize(text: str, max_len: int) -> str:
 
 
 # ─────────────────────────────────────────────
-# SESSION STORE
+# SESSION STORE — in memory, auto deletes after 1hr
 # ─────────────────────────────────────────────
 sessions: dict = {}
 SESSION_TTL = 3600
@@ -104,13 +104,11 @@ def _cleanup_sessions():
 
 
 # ─────────────────────────────────────────────
-# API CLIENTS — lazy init so server starts even if keys missing
+# API CLIENTS — lazy init (server starts even if keys missing)
 # ─────────────────────────────────────────────
-_claude = None
-_tavily = None
-import google.generativeai as genai
-
 _gemini_model = None
+_tavily       = None
+
 
 def get_gemini():
     global _gemini_model
@@ -123,14 +121,12 @@ def get_gemini():
     return _gemini_model
 
 
-
-
 def get_tavily():
     global _tavily
     if _tavily is None:
         key = os.getenv("TAVILY_API_KEY", "")
         if not key:
-            raise HTTPException(500, "TAVILY_API_KEY not set in Railway environment variables.")
+            raise HTTPException(500, "TAVILY_API_KEY not set in Railway variables.")
         _tavily = TavilyClient(api_key=key)
     return _tavily
 
@@ -163,10 +159,10 @@ def parse_pdf(file_bytes: bytes, label: str = "file") -> str:
 # ─────────────────────────────────────────────
 def gather_intelligence(company: str, role: str, location: str) -> dict:
     searches = [
-        ("container_a",   f"ATS resume tips {role} hiring manager advice 2025"),
-        ("container_b",   f"{company} hiring culture resume tips recruiter {location}"),
-        ("container_c",   f"{role} resume best practices skills {location} requirements"),
-        ("company_tips",  f"{company} recruiter hiring manager LinkedIn resume advice"),
+        ("container_a",  f"ATS resume tips {role} hiring manager advice 2025"),
+        ("container_b",  f"{company} hiring culture resume tips recruiter {location}"),
+        ("container_c",  f"{role} resume best practices skills {location} requirements"),
+        ("company_tips", f"{company} recruiter hiring manager LinkedIn resume advice"),
     ]
     results = {}
     for key, query in searches:
@@ -196,10 +192,10 @@ def format_intel(intel: dict) -> str:
 
 
 # ─────────────────────────────────────────────
-# CLAUDE HELPER
+# AI CALL
 # ─────────────────────────────────────────────
-def call_claude(prompt: str, max_tokens: int = 2500) -> str:
-    model = get_gemini()
+def call_ai(prompt: str, max_tokens: int = 2500) -> str:
+    model    = get_gemini()
     response = model.generate_content(
         prompt,
         generation_config=genai.types.GenerationConfig(
@@ -211,6 +207,9 @@ def call_claude(prompt: str, max_tokens: int = 2500) -> str:
 
 
 def extract_json(text: str) -> dict:
+    # Strip markdown fences if Gemini wraps response in ```json ... ```
+    text = re.sub(r"```json\s*", "", text)
+    text = re.sub(r"```\s*",     "", text)
     match = re.search(r'\{[\s\S]*\}', text)
     if match:
         try:
@@ -226,26 +225,26 @@ def extract_json(text: str) -> dict:
 
 @app.get("/health")
 def health():
-    """Test endpoint — open in browser to confirm backend is alive"""
+    """Open this URL in browser to confirm backend is alive and keys are set"""
     return {
-        "status":            "ok",
-        "sessions_active":   len(sessions),
-        "anthropic_key_set": bool(os.getenv("ANTHROPIC_API_KEY")),
-        "tavily_key_set":    bool(os.getenv("TAVILY_API_KEY")),
-        "password_set":      bool(os.getenv("APP_PASSWORD")),
+        "status":          "ok",
+        "sessions_active": len(sessions),
+        "gemini_key_set":  bool(os.getenv("GEMINI_API_KEY")),
+        "tavily_key_set":  bool(os.getenv("TAVILY_API_KEY")),
+        "password_set":    bool(os.getenv("APP_PASSWORD")),
     }
 
 
 @app.post("/api/analyze")
 async def analyze(
     request:         Request,
-    company:         str                   = Form(...),
-    role:            str                   = Form(...),
-    location:        str                   = Form(...),
-    job_description: str                   = Form(...),
-    cv_file:         UploadFile            = File(...),
-    linkedin_file:   Optional[UploadFile]  = File(None),
-    password:        str                   = Form(...),
+    company:         str                  = Form(...),
+    role:            str                  = Form(...),
+    location:        str                  = Form(...),
+    job_description: str                  = Form(...),
+    cv_file:         UploadFile           = File(...),
+    linkedin_file:   Optional[UploadFile] = File(None),
+    password:        str                  = Form(...),
 ):
     # Auth
     if not verify_password(password):
@@ -257,7 +256,7 @@ async def analyze(
     if limited:
         raise HTTPException(429, msg)
 
-    # Validate
+    # Validate inputs
     company         = sanitize(company,         MAX_FIELD_LENGTH)
     role            = sanitize(role,            MAX_FIELD_LENGTH)
     location        = sanitize(location,        MAX_FIELD_LENGTH)
@@ -284,12 +283,12 @@ async def analyze(
             except HTTPException:
                 linkedin_text = ""
 
-    # Intelligence
+    # Gather intelligence
     request_log[ip].append(time.time())
     intel         = gather_intelligence(company, role, location)
     intel_summary = format_intel(intel)
 
-    # Analysis
+    # AI Analysis
     analysis_prompt = f"""You are an expert CV analyst and ATS specialist.
 
 COMPANY: {company}
@@ -314,12 +313,12 @@ TASKS:
 3. Find LinkedIn vs CV contradictions (dates, titles, companies)
 4. Identify ABC Intersection — items in ATS best practices AND company culture AND role requirements
 5. Extract company-specific recruiter tips from intelligence
-6. Write max 5 targeted questions for info we cannot find in the CV that would change the output
+6. Write max 5 targeted questions for info we cannot get from the CV that would change the output
 
-NEVER ask: "are you a strong match?" — useless.
+NEVER ask: are you a strong match — useless.
 ALWAYS ask if relevant: employment gap explanations, real metrics, referral at {company}, hidden relevant experience.
 
-Reply ONLY with valid JSON — absolutely no markdown, no code fences, no extra text:
+IMPORTANT: Reply ONLY with a valid JSON object. No markdown. No code fences. No explanation. Just the raw JSON:
 {{
   "gaps_found": ["gap1", "gap2"],
   "ai_words_detected": ["word1"],
@@ -344,7 +343,7 @@ Reply ONLY with valid JSON — absolutely no markdown, no code fences, no extra 
 }}"""
 
     try:
-        raw      = call_claude(analysis_prompt, max_tokens=2000)
+        raw      = call_ai(analysis_prompt, max_tokens=2000)
         analysis = extract_json(raw)
     except Exception as e:
         raise HTTPException(500, f"AI analysis failed: {str(e)}")
@@ -421,50 +420,50 @@ RULES:
 CV STRUCTURE (non-negotiable):
 - NO tables, NO columns, NO text boxes, NO graphics, NO icons, NO photos
 - Plain text only
-- Headers: Summary | Experience | Education | Skills | Projects | Certifications
+- Section headers: Summary | Experience | Education | Skills | Projects | Certifications
 - Dates: Mon YYYY only (e.g. Jan 2022)
 
 ANTI-AI-DETECTION:
-- BANNED: {', '.join(ai_words) if ai_words else 'none found — still avoid globally'}
+- BANNED words: {', '.join(ai_words) if ai_words else 'none found — still avoid globally'}
 - Also always avoid: spearheaded, leveraged, orchestrated, streamlined, pioneered, facilitated, demonstrated, fostered, cultivated, navigated, synergize, dynamic, passionate, results-driven, detail-oriented, proactive, innovative
-- Vary bullet lengths — some 8 words, some 25 — never uniform
-- Only use real confirmed numbers — never invent percentages
-- No real numbers? Use specific qualitative detail instead
-- Summary must be specific to THIS role at THIS company
+- Vary bullet lengths naturally — some 8 words, some 25 — never uniform
+- Only use numbers the candidate confirmed are real — never invent percentages
+- No real numbers available? Use specific qualitative detail instead
+- Summary must be specific to THIS role at THIS company — zero templates
 
-GOOD VERBS: Built, Delivered, Led, Drove, Reduced, Grew, Launched, Solved, Shipped, Cut, Improved, Designed, Implemented, Deployed, Managed, Negotiated, Trained, Established, Resolved, Automated, Scaled
+GOOD ACTION VERBS: Built, Delivered, Led, Drove, Reduced, Grew, Launched, Solved, Shipped, Cut, Improved, Designed, Implemented, Deployed, Managed, Negotiated, Trained, Established, Resolved, Automated, Scaled
 
 COVER LETTER:
-- Para 1: Specific hook about THIS company — no generic openers
-- Para 2: Candidate background to their exact need
-- Para 3: One concrete proof example
-- Para 4: Confident close
+- Para 1: Specific hook about THIS company — no generic openers ever
+- Para 2: Candidate background matched to their exact need
+- Para 3: One concrete proof example with real detail
+- Para 4: Confident close — not desperate, not arrogant
 
-Reply ONLY with valid JSON — no markdown fences, no extra text:
+IMPORTANT: Reply ONLY with a valid JSON object. No markdown. No code fences. No explanation. Just raw JSON:
 {{
-  "cv_ats_version": "complete plain-text ATS CV",
-  "cv_human_version": "same CV slightly polished",
-  "cover_letter": "complete cover letter",
+  "cv_ats_version": "complete plain-text ATS optimised CV here",
+  "cv_human_version": "same CV slightly polished for human reading",
+  "cover_letter": "complete cover letter full text",
   "linkedin_tips": [
     {{
-      "section": "section name",
-      "current_issue": "what is weak",
-      "recommended_text": "exact replacement",
-      "why": "reason"
+      "section": "section name e.g. Headline",
+      "current_issue": "what is weak or wrong",
+      "recommended_text": "exact replacement text to use",
+      "why": "specific reason tied to this role and company"
     }}
   ],
   "change_log": [
     {{
-      "original": "original text",
-      "changed_to": "new text",
-      "reason": "why"
+      "original": "original text from CV",
+      "changed_to": "new improved text",
+      "reason": "why this change was made"
     }}
   ],
-  "application_strategy": "who to contact, how, timing"
+  "application_strategy": "specific advice on who to contact at this company, how, what to say, and timing"
 }}"""
 
     try:
-        raw    = call_claude(generate_prompt, max_tokens=4500)
+        raw    = call_ai(generate_prompt, max_tokens=4500)
         result = extract_json(raw)
     except Exception as e:
         raise HTTPException(500, f"CV generation failed: {str(e)}")
@@ -472,6 +471,7 @@ Reply ONLY with valid JSON — no markdown fences, no extra text:
     if not result:
         raise HTTPException(500, "AI returned malformed output. Please try again.")
 
+    # Delete session immediately after generation — no data left behind
     sessions.pop(session_id, None)
 
     return {
