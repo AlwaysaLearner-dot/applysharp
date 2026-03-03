@@ -1,7 +1,6 @@
 """
 CV Optimizer Backend — FastAPI
-Security: Rate limiting, session-based context, input validation, CORS
-Data: Processed in memory, never persisted. Sessions auto-deleted after 1 hour.
+Fixed: CORS, model name, lazy API init, better error handling
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Form, Body
@@ -21,27 +20,26 @@ from tavily import TavilyClient
 # ─────────────────────────────────────────────
 # APP SETUP
 # ─────────────────────────────────────────────
-app = FastAPI(docs_url=None, redoc_url=None)  # Disable docs in production
+app = FastAPI(docs_url=None, redoc_url=None)
 
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
-
+# CORS — open during setup, locks down once working
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL],
+    allow_origins=["*"],
     allow_credentials=False,
-    allow_methods=["POST", "GET"],
-    allow_headers=["Content-Type", "X-App-Password"],
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 # ─────────────────────────────────────────────
 # SECURITY & RATE LIMITING
 # ─────────────────────────────────────────────
-request_log: dict[str, list[float]] = defaultdict(list)
+request_log: dict = defaultdict(list)
 
-MAX_PER_HOUR = 2        # Max CV analysis starts per hour per IP
-MAX_PER_DAY = 5         # Max CV analysis starts per day per IP
-MAX_FILE_SIZE = 5 * 1024 * 1024  # 5MB
-MAX_JD_LENGTH = 8000
+MAX_PER_HOUR    = 3
+MAX_PER_DAY     = 8
+MAX_FILE_SIZE   = 5 * 1024 * 1024
+MAX_JD_LENGTH   = 8000
 MAX_FIELD_LENGTH = 300
 
 APP_PASSWORD = os.getenv("APP_PASSWORD", "changeme")
@@ -51,26 +49,23 @@ def get_ip(request: Request) -> str:
     forwarded = request.headers.get("X-Forwarded-For")
     if forwarded:
         return forwarded.split(",")[0].strip()
-    return request.client.host or "unknown"
+    return (request.client.host if request.client else None) or "unknown"
 
 
-def check_rate_limit(ip: str) -> tuple[bool, str]:
+def check_rate_limit(ip: str):
     now = time.time()
-    # Clean entries older than 24h
     request_log[ip] = [t for t in request_log[ip] if now - t < 86400]
-
     hour_count = sum(1 for t in request_log[ip] if now - t < 3600)
-    day_count = len(request_log[ip])
-
+    day_count  = len(request_log[ip])
     if hour_count >= MAX_PER_HOUR:
-        return True, f"Slow down — max {MAX_PER_HOUR} analyses per hour. Try again soon."
+        return True, f"Max {MAX_PER_HOUR} analyses per hour. Try again soon."
     if day_count >= MAX_PER_DAY:
-        return True, f"Daily limit hit — max {MAX_PER_DAY} CVs per day. Come back tomorrow."
+        return True, f"Daily limit of {MAX_PER_DAY} reached. Come back tomorrow."
     return False, ""
 
 
 def verify_password(pwd: str) -> bool:
-    return pwd.strip() == APP_PASSWORD.strip()
+    return str(pwd).strip() == str(APP_PASSWORD).strip()
 
 
 def sanitize(text: str, max_len: int) -> str:
@@ -78,21 +73,20 @@ def sanitize(text: str, max_len: int) -> str:
 
 
 # ─────────────────────────────────────────────
-# SESSION STORE (in-memory, auto-expires 1hr)
-# Server holds CV text — client only gets session_id
+# SESSION STORE
 # ─────────────────────────────────────────────
-sessions: dict[str, dict] = {}
+sessions: dict = {}
 SESSION_TTL = 3600
 
 
 def create_session(data: dict) -> str:
-    cleanup_sessions()
+    _cleanup_sessions()
     sid = str(uuid.uuid4())
     sessions[sid] = {"data": data, "created_at": time.time()}
     return sid
 
 
-def get_session(sid: str) -> dict | None:
+def get_session(sid: str):
     s = sessions.get(sid)
     if not s:
         return None
@@ -102,18 +96,38 @@ def get_session(sid: str) -> dict | None:
     return s["data"]
 
 
-def cleanup_sessions():
-    now = time.time()
-    expired = [k for k, v in sessions.items() if now - v["created_at"] > SESSION_TTL]
-    for k in expired:
+def _cleanup_sessions():
+    now  = time.time()
+    dead = [k for k, v in sessions.items() if now - v["created_at"] > SESSION_TTL]
+    for k in dead:
         del sessions[k]
 
 
 # ─────────────────────────────────────────────
-# API CLIENTS
+# API CLIENTS — lazy init so server starts even if keys missing
 # ─────────────────────────────────────────────
-claude_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
+_claude = None
+_tavily = None
+
+
+def get_claude():
+    global _claude
+    if _claude is None:
+        key = os.getenv("ANTHROPIC_API_KEY", "")
+        if not key:
+            raise HTTPException(500, "ANTHROPIC_API_KEY not set in Railway environment variables.")
+        _claude = Anthropic(api_key=key)
+    return _claude
+
+
+def get_tavily():
+    global _tavily
+    if _tavily is None:
+        key = os.getenv("TAVILY_API_KEY", "")
+        if not key:
+            raise HTTPException(500, "TAVILY_API_KEY not set in Railway environment variables.")
+        _tavily = TavilyClient(api_key=key)
+    return _tavily
 
 
 # ─────────────────────────────────────────────
@@ -125,41 +139,34 @@ def parse_pdf(file_bytes: bytes, label: str = "file") -> str:
             text = "\n".join(
                 page.extract_text() or "" for page in pdf.pages
             ).strip()
-        if not text or len(text) < 50:
+        if not text or len(text) < 30:
             raise HTTPException(
-                status_code=400,
-                detail=f"Could not read text from {label}. Make sure it's not a scanned image PDF."
+                400,
+                f"Could not read text from {label}. "
+                "Make sure it is a real text-based PDF — not a scanned image. "
+                "Re-export from Word or Google Docs as PDF."
             )
         return text
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Failed to parse {label}: {str(e)}")
+        raise HTTPException(400, f"Failed to parse {label}: {str(e)}")
 
 
 # ─────────────────────────────────────────────
-# INTELLIGENCE GATHERING (Containers A, B, C)
+# INTELLIGENCE GATHERING (Containers A / B / C)
 # ─────────────────────────────────────────────
 def gather_intelligence(company: str, role: str, location: str) -> dict:
-    results = {}
     searches = [
-        ("container_a", f"ATS resume tips {role} hiring manager advice 2024 2025"),
-        ("container_b", f"{company} company culture hiring resume tips recruiter {location}"),
-        ("container_c", f"{role} resume best practices skills {location} job requirements"),
-        ("company_tips", f"{company} recruiter hiring manager resume advice LinkedIn tips"),
+        ("container_a",   f"ATS resume tips {role} hiring manager advice 2025"),
+        ("container_b",   f"{company} hiring culture resume tips recruiter {location}"),
+        ("container_c",   f"{role} resume best practices skills {location} requirements"),
+        ("company_tips",  f"{company} recruiter hiring manager LinkedIn resume advice"),
     ]
-    trusted_domains = [
-        "linkedin.com", "glassdoor.com", "indeed.com",
-        "jobscan.co", "shrm.org", "hbr.org", "lever.co",
-        "greenhouse.io", "workday.com"
-    ]
+    results = {}
     for key, query in searches:
         try:
-            r = tavily_client.search(
-                query=query,
-                max_results=4,
-                include_domains=trusted_domains if key in ("container_a", "container_c") else None
-            )
+            r = get_tavily().search(query=query, max_results=4)
             results[key] = r.get("results", [])
         except Exception:
             results[key] = []
@@ -167,32 +174,30 @@ def gather_intelligence(company: str, role: str, location: str) -> dict:
 
 
 def format_intel(intel: dict) -> str:
-    sections = {
-        "container_a": "CONTAINER A — ATS & Universal Resume Science",
-        "container_b": "CONTAINER B — Company Intelligence",
-        "container_c": "CONTAINER C — Role Intelligence",
-        "company_tips": "COMPANY-SPECIFIC TIPS & RECRUITER INSIGHTS",
+    labels = {
+        "container_a":  "CONTAINER A — ATS & Universal Resume Science",
+        "container_b":  "CONTAINER B — Company Intelligence",
+        "container_c":  "CONTAINER C — Role Intelligence",
+        "company_tips": "COMPANY-SPECIFIC TIPS",
     }
     lines = []
-    for key, label in sections.items():
+    for key, label in labels.items():
         items = intel.get(key, [])
         if items:
             lines.append(f"\n=== {label} ===")
             for r in items[:3]:
-                url = r.get("url", "")
-                content = r.get("content", "")[:400]
-                lines.append(f"Source: {url}\n{content}\n")
+                lines.append(f"Source: {r.get('url','')}\n{r.get('content','')[:350]}\n")
     return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────
-# CLAUDE HELPERS
+# CLAUDE HELPER
 # ─────────────────────────────────────────────
 def call_claude(prompt: str, max_tokens: int = 2500) -> str:
-    resp = claude_client.messages.create(
+    resp = get_claude().messages.create(
         model="claude-opus-4-5",
         max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}]
+        messages=[{"role": "user", "content": prompt}],
     )
     return resp.content[0].text
 
@@ -208,65 +213,76 @@ def extract_json(text: str) -> dict:
 
 
 # ─────────────────────────────────────────────
-# ENDPOINTS
+# ROUTES
 # ─────────────────────────────────────────────
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "sessions_active": len(sessions)}
+    """Test endpoint — open in browser to confirm backend is alive"""
+    return {
+        "status":            "ok",
+        "sessions_active":   len(sessions),
+        "anthropic_key_set": bool(os.getenv("ANTHROPIC_API_KEY")),
+        "tavily_key_set":    bool(os.getenv("TAVILY_API_KEY")),
+        "password_set":      bool(os.getenv("APP_PASSWORD")),
+    }
 
 
 @app.post("/api/analyze")
 async def analyze(
-    request: Request,
-    company: str = Form(...),
-    role: str = Form(...),
-    location: str = Form(...),
-    job_description: str = Form(...),
-    cv_file: UploadFile = File(...),
-    linkedin_file: Optional[UploadFile] = File(None),
-    password: str = Form(...),
+    request:         Request,
+    company:         str                   = Form(...),
+    role:            str                   = Form(...),
+    location:        str                   = Form(...),
+    job_description: str                   = Form(...),
+    cv_file:         UploadFile            = File(...),
+    linkedin_file:   Optional[UploadFile]  = File(None),
+    password:        str                   = Form(...),
 ):
-    # 1. Auth
+    # Auth
     if not verify_password(password):
-        raise HTTPException(status_code=401, detail="Wrong password. Access denied.")
+        raise HTTPException(401, "Wrong password. Access denied.")
 
-    # 2. Rate limit
+    # Rate limit
     ip = get_ip(request)
     limited, msg = check_rate_limit(ip)
     if limited:
-        raise HTTPException(status_code=429, detail=msg)
+        raise HTTPException(429, msg)
 
-    # 3. Input validation
-    company = sanitize(company, MAX_FIELD_LENGTH)
-    role = sanitize(role, MAX_FIELD_LENGTH)
-    location = sanitize(location, MAX_FIELD_LENGTH)
+    # Validate
+    company         = sanitize(company,         MAX_FIELD_LENGTH)
+    role            = sanitize(role,            MAX_FIELD_LENGTH)
+    location        = sanitize(location,        MAX_FIELD_LENGTH)
     job_description = sanitize(job_description, MAX_JD_LENGTH)
 
-    if not company or not role or not location or not job_description:
-        raise HTTPException(status_code=400, detail="All fields are required.")
+    if not all([company, role, location, job_description]):
+        raise HTTPException(400, "All text fields are required.")
+    if len(job_description) < 80:
+        raise HTTPException(400, "Job description too short — paste the full JD.")
 
-    # 4. Parse CV
+    # Parse CV
     cv_bytes = await cv_file.read()
     if len(cv_bytes) > MAX_FILE_SIZE:
-        raise HTTPException(status_code=400, detail="CV file exceeds 5MB limit.")
+        raise HTTPException(400, "CV file exceeds 5 MB.")
     cv_text = parse_pdf(cv_bytes, "CV")
 
-    # 5. Parse LinkedIn PDF (optional)
+    # Parse LinkedIn (optional — failure is non-fatal)
     linkedin_text = ""
     if linkedin_file and linkedin_file.filename:
         li_bytes = await linkedin_file.read()
-        if len(li_bytes) > MAX_FILE_SIZE:
-            raise HTTPException(status_code=400, detail="LinkedIn PDF exceeds 5MB limit.")
-        linkedin_text = parse_pdf(li_bytes, "LinkedIn PDF")
+        if len(li_bytes) <= MAX_FILE_SIZE:
+            try:
+                linkedin_text = parse_pdf(li_bytes, "LinkedIn PDF")
+            except HTTPException:
+                linkedin_text = ""
 
-    # 6. Gather intelligence (rate-counted only here, not on generate)
+    # Intelligence
     request_log[ip].append(time.time())
-    intel = gather_intelligence(company, role, location)
+    intel         = gather_intelligence(company, role, location)
     intel_summary = format_intel(intel)
 
-    # 7. Analysis prompt — detect gaps, questions, auto-fixes, heads-up tips
-    analysis_prompt = f"""You are an expert CV analyst, ATS specialist, and career strategist. Analyze this job application thoroughly.
+    # Analysis
+    analysis_prompt = f"""You are an expert CV analyst and ATS specialist.
 
 COMPANY: {company}
 ROLE: {role}
@@ -275,83 +291,75 @@ LOCATION: {location}
 JOB DESCRIPTION:
 {job_description[:3500]}
 
-CANDIDATE'S CV:
+CANDIDATE CV:
 {cv_text[:3000]}
 
-LINKEDIN PROFILE (if provided):
+LINKEDIN PROFILE:
 {linkedin_text[:2000] if linkedin_text else "Not provided"}
 
 MARKET INTELLIGENCE:
-{intel_summary[:3000]}
+{intel_summary[:2500]}
 
-IMPORTANT ANALYSIS TASKS:
-1. Find ALL gaps, mismatches, errors (employment gaps, skills missing from JD, weak language, passive voice, responsibility-lists instead of achievements, missing quantification)
-2. Find what AI detection will flag — overused words like "spearheaded, leveraged, orchestrated, streamlined, pioneered, facilitated, demonstrated, fostered, cultivated, navigated, synergize, dynamic, results-driven, passionate" — list them if found in the CV
-3. Detect LinkedIn vs CV contradictions (dates, titles, companies)
-4. Find the ABC Intersection — items that appear in ALL THREE: (A) ATS best practices + (B) company intelligence + (C) role requirements — these are HIGHEST priority
-5. Extract company-specific tips or warnings from the intelligence
-6. Generate targeted questions (max 6) for things we genuinely CANNOT determine from the CV — only ask if the answer would meaningfully change the output
+TASKS:
+1. Find ALL gaps and weaknesses (missing keywords, vague achievements, passive voice, no metrics, employment gaps)
+2. Detect AI-generated language — flag these words if found in CV: spearheaded, leveraged, orchestrated, streamlined, pioneered, facilitated, demonstrated, fostered, cultivated, navigated, synergize, dynamic, results-driven, passionate, detail-oriented, proactive
+3. Find LinkedIn vs CV contradictions (dates, titles, companies)
+4. Identify ABC Intersection — items in ATS best practices AND company culture AND role requirements
+5. Extract company-specific recruiter tips from intelligence
+6. Write max 5 targeted questions for info we cannot find in the CV that would change the output
 
-Questions to ALWAYS include if relevant:
-- Employment gaps explanation
-- Real numbers (team size, revenue, users, % improvements) for any vague achievements
-- Do you have a referral or LinkedIn connection at {company}?
-- Any relevant experience not shown on CV?
-- Anything the CV gets wrong or misrepresents?
+NEVER ask: "are you a strong match?" — useless.
+ALWAYS ask if relevant: employment gap explanations, real metrics, referral at {company}, hidden relevant experience.
 
-Questions to NEVER ask:
-- Are you a strong match or stretch? (they don't know, and it doesn't help us)
-- Generic questions answerable from the CV
-
-Respond ONLY with this JSON structure, no other text:
+Reply ONLY with valid JSON — absolutely no markdown, no code fences, no extra text:
 {{
-  "gaps_found": ["specific gap 1", "specific gap 2"],
-  "ai_words_detected": ["word1", "word2"],
-  "auto_fixes": ["Grammar: fixed X", "Spelling: corrected Y", "Passive voice: changed Z"],
+  "gaps_found": ["gap1", "gap2"],
+  "ai_words_detected": ["word1"],
+  "auto_fixes": ["Grammar: fixed X", "Spelling: corrected Y"],
   "linkedin_contradictions": ["issue1"],
-  "abc_intersection": ["highest priority item 1", "item 2", "item 3"],
+  "abc_intersection": ["item1", "item2"],
   "questions": [
     {{
       "id": "q1",
-      "question": "exact question text",
-      "context": "one sentence why this matters for the CV",
-      "type": "text"
+      "question": "question text",
+      "context": "why this matters"
     }}
   ],
   "heads_up_tips": [
     {{
-      "tip": "specific actionable tip",
-      "source": "source name (e.g. LinkedIn post by [Company] recruiter / Glassdoor interview review)",
-      "source_url": "url if available",
-      "action_taken": "what the tool will do about it in the CV"
+      "tip": "actionable tip",
+      "source": "source name",
+      "source_url": "url or empty string",
+      "action_taken": "what we will do in the CV"
     }}
   ]
 }}"""
 
-    raw = call_claude(analysis_prompt, max_tokens=2000)
-    analysis = extract_json(raw)
+    try:
+        raw      = call_claude(analysis_prompt, max_tokens=2000)
+        analysis = extract_json(raw)
+    except Exception as e:
+        raise HTTPException(500, f"AI analysis failed: {str(e)}")
 
-    # 8. Store in session (CV text stays server-side)
-    session_data = {
-        "company": company,
-        "role": role,
-        "location": location,
+    session_id = create_session({
+        "company":         company,
+        "role":            role,
+        "location":        location,
         "job_description": job_description,
-        "cv_text": cv_text[:3500],
-        "linkedin_text": linkedin_text[:2500],
-        "intel_summary": intel_summary[:3000],
-        "analysis": analysis,
-    }
-    session_id = create_session(session_data)
+        "cv_text":         cv_text[:3500],
+        "linkedin_text":   linkedin_text[:2500],
+        "intel_summary":   intel_summary[:3000],
+        "analysis":        analysis,
+    })
 
     return {
-        "session_id": session_id,
-        "questions": analysis.get("questions", []),
-        "auto_fixes": analysis.get("auto_fixes", []),
-        "gaps_found": analysis.get("gaps_found", []),
-        "ai_words_detected": analysis.get("ai_words_detected", []),
+        "session_id":              session_id,
+        "questions":               analysis.get("questions", []),
+        "auto_fixes":              analysis.get("auto_fixes", []),
+        "gaps_found":              analysis.get("gaps_found", []),
+        "ai_words_detected":       analysis.get("ai_words_detected", []),
         "linkedin_contradictions": analysis.get("linkedin_contradictions", []),
-        "heads_up_tips": analysis.get("heads_up_tips", []),
+        "heads_up_tips":           analysis.get("heads_up_tips", []),
     }
 
 
@@ -359,129 +367,109 @@ Respond ONLY with this JSON structure, no other text:
 async def generate(request: Request, body: dict = Body(...)):
     # Auth
     if not verify_password(body.get("password", "")):
-        raise HTTPException(status_code=401, detail="Wrong password.")
+        raise HTTPException(401, "Wrong password.")
 
-    session_id = body.get("session_id", "")
+    session_id   = body.get("session_id", "")
     user_answers = body.get("user_answers", {})
 
     ctx = get_session(session_id)
     if not ctx:
-        raise HTTPException(status_code=404, detail="Session expired. Please re-upload your CV and start again.")
+        raise HTTPException(404, "Session expired. Please start again and re-upload your CV.")
 
-    analysis = ctx.get("analysis", {})
-    answers_text = "\n".join(
-        [f"Q: {q}\nA: {a}" for q, a in user_answers.items()]
-    ) if user_answers else "Candidate provided no additional information."
+    analysis     = ctx.get("analysis", {})
+    ai_words     = analysis.get("ai_words_detected", [])
+    abc          = ", ".join(analysis.get("abc_intersection", []))
+    answers_text = (
+        "\n".join(f"Q: {q}\nA: {a}" for q, a in user_answers.items())
+        if user_answers else "No additional information provided."
+    )
 
-    abc = ", ".join(analysis.get("abc_intersection", []))
-    ai_words = analysis.get("ai_words_detected", [])
+    generate_prompt = f"""You are an elite CV writer, ATS specialist, and career strategist.
 
-    generate_prompt = f"""You are an elite CV writer, ATS specialist, career strategist, and cover letter writer. Generate a complete job application package.
+COMPANY:  {ctx['company']}
+ROLE:     {ctx['role']}
+LOCATION: {ctx['location']}
 
-─── CONTEXT ───
-Company: {ctx['company']}
-Role: {ctx['role']}
-Location: {ctx['location']}
-Job Description: {ctx['job_description'][:3500]}
+JOB DESCRIPTION:
+{ctx['job_description'][:3500]}
 
-─── ORIGINAL CV ───
+ORIGINAL CV:
 {ctx['cv_text']}
 
-─── LINKEDIN PROFILE ───
+LINKEDIN PROFILE:
 {ctx['linkedin_text'] if ctx['linkedin_text'] else "Not provided"}
 
-─── MARKET INTELLIGENCE ───
+MARKET INTELLIGENCE:
 {ctx['intel_summary']}
 
-─── ABC INTERSECTION (HIGHEST PRIORITY — optimize for these first) ───
+ABC INTERSECTION (optimise these first):
 {abc}
 
-─── CANDIDATE'S ANSWERS TO CLARIFYING QUESTIONS ───
+CANDIDATE ANSWERS:
 {answers_text}
 
-─── STRICT CV GENERATION RULES ───
+RULES:
 
-STRUCTURE RULES (non-negotiable):
-- NO tables, NO text boxes, NO columns, NO graphics, NO icons
-- Plain text structure ONLY — ATS must read every word
-- Standard section headers: Summary, Experience, Education, Skills, Projects, Certifications
-- Consistent date format: Mon YYYY (e.g. Jan 2022)
+CV STRUCTURE (non-negotiable):
+- NO tables, NO columns, NO text boxes, NO graphics, NO icons, NO photos
+- Plain text only
+- Headers: Summary | Experience | Education | Skills | Projects | Certifications
+- Dates: Mon YYYY only (e.g. Jan 2022)
 
-ANTI-AI-DETECTION RULES (critical):
-- BANNED words (found in original CV: {', '.join(ai_words) if ai_words else 'none detected, still avoid globally'}):
-  spearheaded, leveraged, orchestrated, streamlined, pioneered, facilitated, demonstrated,
-  fostered, cultivated, navigated, synergize, dynamic, passionate, results-driven,
-  detail-oriented, proactive, innovative, strategic thinker, strong communication skills
-- Vary bullet point lengths NATURALLY — mix 8-word punchy lines with 20-25 word detailed ones
-- ONLY use numbers/percentages the candidate confirmed as real in their answers
-- Where no real numbers: use specific qualitative language ("across a 4-person team" not "significantly improved efficiency by X%")
-- Summary must be specific to THIS role at THIS company — zero templates allowed
-- Use the candidate's natural voice from their answers — pull their actual phrases and style
+ANTI-AI-DETECTION:
+- BANNED: {', '.join(ai_words) if ai_words else 'none found — still avoid globally'}
+- Also always avoid: spearheaded, leveraged, orchestrated, streamlined, pioneered, facilitated, demonstrated, fostered, cultivated, navigated, synergize, dynamic, passionate, results-driven, detail-oriented, proactive, innovative
+- Vary bullet lengths — some 8 words, some 25 — never uniform
+- Only use real confirmed numbers — never invent percentages
+- No real numbers? Use specific qualitative detail instead
+- Summary must be specific to THIS role at THIS company
 
-STRONG ACTION VERBS to use:
-Built, Delivered, Led, Drove, Reduced, Grew, Launched, Solved, Shipped, Cut, Doubled,
-Improved, Designed, Implemented, Deployed, Authored, Coordinated, Produced, Managed,
-Negotiated, Trained, Established, Resolved, Automated, Migrated, Scaled, Revamped
+GOOD VERBS: Built, Delivered, Led, Drove, Reduced, Grew, Launched, Solved, Shipped, Cut, Improved, Designed, Implemented, Deployed, Managed, Negotiated, Trained, Established, Resolved, Automated, Scaled
 
-CONTENT RULES:
-- Achievement-first bullets, not responsibility-first ("Built X that reduced Y by Z" not "Responsible for X")
-- Put the most JD-keyword-rich content in the top third of the CV (ATS and human both scan here first)
-- Remove everything irrelevant to this specific role
-- If LinkedIn profile provided and differs from CV, align them consistently
+COVER LETTER:
+- Para 1: Specific hook about THIS company — no generic openers
+- Para 2: Candidate background to their exact need
+- Para 3: One concrete proof example
+- Para 4: Confident close
 
-COVER LETTER RULES:
-- Para 1: Hook — specific thing about THIS company (use intelligence gathered) — no generic openers
-- Para 2: Bridge — how candidate's specific background connects to their exact need
-- Para 3: Proof — one concrete example not fully shown in CV
-- Para 4: Close — clear confident ask, not desperate or arrogant
-- Same anti-AI rules apply — no banned words, varied sentence length, human voice
-- Location-aware: if international role, naturally address availability/timezone if relevant
-
-LINKEDIN TIPS RULES:
-- Specific, actionable changes only
-- Not generic advice — tailored to this company and role
-- Prioritize: Headline, About section, top 3 experience descriptions, Skills section
-
-Respond ONLY with this exact JSON structure, no other text:
+Reply ONLY with valid JSON — no markdown fences, no extra text:
 {{
-  "cv_ats_version": "complete optimized CV as plain text — this is the full document",
-  "cv_human_version": "same CV with light formatting improvements — still no tables",
-  "cover_letter": "complete tailored cover letter — full text",
+  "cv_ats_version": "complete plain-text ATS CV",
+  "cv_human_version": "same CV slightly polished",
+  "cover_letter": "complete cover letter",
   "linkedin_tips": [
     {{
-      "section": "Headline",
-      "current_issue": "what is wrong or weak",
-      "recommended_text": "exact new text to use",
-      "why": "specific reason tied to this role/company"
+      "section": "section name",
+      "current_issue": "what is weak",
+      "recommended_text": "exact replacement",
+      "why": "reason"
     }}
   ],
   "change_log": [
     {{
-      "original": "original text from CV",
-      "changed_to": "what we changed it to",
-      "reason": "specific reason"
+      "original": "original text",
+      "changed_to": "new text",
+      "reason": "why"
     }}
   ],
-  "application_strategy": "specific advice: who to contact at this company, how, what to say, timing — based on what we know about their hiring process"
+  "application_strategy": "who to contact, how, timing"
 }}"""
 
-    raw = call_claude(generate_prompt, max_tokens=4500)
-    result = extract_json(raw)
+    try:
+        raw    = call_claude(generate_prompt, max_tokens=4500)
+        result = extract_json(raw)
+    except Exception as e:
+        raise HTTPException(500, f"CV generation failed: {str(e)}")
 
     if not result:
-        raise HTTPException(
-            status_code=500,
-            detail="Generation failed. The AI response was malformed. Please try again."
-        )
+        raise HTTPException(500, "AI returned malformed output. Please try again.")
 
-    # Clean up session immediately after generation
-    if session_id in sessions:
-        del sessions[session_id]
+    sessions.pop(session_id, None)
 
     return {
-        "status": "complete",
-        "output": result,
-        "heads_up_tips": analysis.get("heads_up_tips", []),
+        "status":             "complete",
+        "output":             result,
+        "heads_up_tips":      analysis.get("heads_up_tips", []),
         "auto_fixes_applied": analysis.get("auto_fixes", []),
-        "ai_words_removed": ai_words,
+        "ai_words_removed":   ai_words,
     }
