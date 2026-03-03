@@ -108,16 +108,21 @@ def _cleanup_sessions():
 # ─────────────────────────────────────────────
 _claude = None
 _tavily = None
+import google.generativeai as genai
 
+_gemini_model = None
 
-def get_claude():
-    global _claude
-    if _claude is None:
-        key = os.getenv("ANTHROPIC_API_KEY", "")
+def get_gemini():
+    global _gemini_model
+    if _gemini_model is None:
+        key = os.getenv("GEMINI_API_KEY", "")
         if not key:
-            raise HTTPException(500, "ANTHROPIC_API_KEY not set in Railway environment variables.")
-        _claude = Anthropic(api_key=key)
-    return _claude
+            raise HTTPException(500, "GEMINI_API_KEY not set in Railway variables.")
+        genai.configure(api_key=key)
+        _gemini_model = genai.GenerativeModel("gemini-1.5-flash")
+    return _gemini_model
+
+
 
 
 def get_tavily():
@@ -194,12 +199,15 @@ def format_intel(intel: dict) -> str:
 # CLAUDE HELPER
 # ─────────────────────────────────────────────
 def call_claude(prompt: str, max_tokens: int = 2500) -> str:
-    resp = get_claude().messages.create(
-        model="claude-opus-4-5",
-        max_tokens=max_tokens,
-        messages=[{"role": "user", "content": prompt}],
+    model = get_gemini()
+    response = model.generate_content(
+        prompt,
+        generation_config=genai.types.GenerationConfig(
+            max_output_tokens=max_tokens,
+            temperature=0.7,
+        )
     )
-    return resp.content[0].text
+    return response.text
 
 
 def extract_json(text: str) -> dict:
