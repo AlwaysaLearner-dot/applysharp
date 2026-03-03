@@ -117,7 +117,7 @@ def get_gemini():
         if not key:
             raise HTTPException(500, "GEMINI_API_KEY not set in Railway variables.")
         genai.configure(api_key=key)
-        _gemini_model = genai.GenerativeModel("gemini-2.0-flash")
+        _gemini_model = genai.GenerativeModel("gemini-2.5-flash-lite")
     return _gemini_model
 
 
