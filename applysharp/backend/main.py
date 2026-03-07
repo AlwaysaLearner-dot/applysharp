@@ -1,7 +1,7 @@
 """
 CV Optimizer Backend — FastAPI
-AI: Google Gemini (free tier)
-Security: Rate limiting, CORS, input validation, session-based, auto-delete
+AI: Google Gemini 2.5 Flash Lite (free)
+Fix: Robust JSON extraction, simplified prompts, better error handling
 """
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Request, Form, Body
@@ -73,7 +73,7 @@ def sanitize(text: str, max_len: int) -> str:
 
 
 # ─────────────────────────────────────────────
-# SESSION STORE — in memory, auto deletes after 1hr
+# SESSION STORE
 # ─────────────────────────────────────────────
 sessions: dict = {}
 SESSION_TTL = 3600
@@ -104,7 +104,7 @@ def _cleanup_sessions():
 
 
 # ─────────────────────────────────────────────
-# API CLIENTS — lazy init (server starts even if keys missing)
+# API CLIENTS
 # ─────────────────────────────────────────────
 _gemini_model = None
 _tavily       = None
@@ -117,7 +117,13 @@ def get_gemini():
         if not key:
             raise HTTPException(500, "GEMINI_API_KEY not set in Railway variables.")
         genai.configure(api_key=key)
-        _gemini_model = genai.GenerativeModel("gemini-2.5-flash-lite")
+        _gemini_model = genai.GenerativeModel(
+            "gemini-2.5-flash-lite",
+            generation_config=genai.GenerationConfig(
+                temperature=0.7,
+                response_mime_type="application/json",  # Force JSON output
+            )
+        )
     return _gemini_model
 
 
@@ -155,7 +161,7 @@ def parse_pdf(file_bytes: bytes, label: str = "file") -> str:
 
 
 # ─────────────────────────────────────────────
-# INTELLIGENCE GATHERING (Containers A / B / C)
+# INTELLIGENCE GATHERING
 # ─────────────────────────────────────────────
 def gather_intelligence(company: str, role: str, location: str) -> dict:
     searches = [
@@ -167,7 +173,7 @@ def gather_intelligence(company: str, role: str, location: str) -> dict:
     results = {}
     for key, query in searches:
         try:
-            r = get_tavily().search(query=query, max_results=4)
+            r = get_tavily().search(query=query, max_results=3)
             results[key] = r.get("results", [])
         except Exception:
             results[key] = []
@@ -176,47 +182,72 @@ def gather_intelligence(company: str, role: str, location: str) -> dict:
 
 def format_intel(intel: dict) -> str:
     labels = {
-        "container_a":  "CONTAINER A — ATS & Universal Resume Science",
-        "container_b":  "CONTAINER B — Company Intelligence",
-        "container_c":  "CONTAINER C — Role Intelligence",
-        "company_tips": "COMPANY-SPECIFIC TIPS",
+        "container_a":  "ATS & Resume Science",
+        "container_b":  "Company Intelligence",
+        "container_c":  "Role Intelligence",
+        "company_tips": "Company-Specific Tips",
     }
     lines = []
     for key, label in labels.items():
         items = intel.get(key, [])
         if items:
             lines.append(f"\n=== {label} ===")
-            for r in items[:3]:
-                lines.append(f"Source: {r.get('url','')}\n{r.get('content','')[:350]}\n")
+            for r in items[:2]:
+                lines.append(f"Source: {r.get('url','')}\n{r.get('content','')[:300]}\n")
     return "\n".join(lines)
 
 
 # ─────────────────────────────────────────────
-# AI CALL
+# AI CALL + ROBUST JSON EXTRACTION
 # ─────────────────────────────────────────────
-def call_ai(prompt: str, max_tokens: int = 2500) -> str:
+def call_ai(prompt: str) -> str:
     model    = get_gemini()
-    response = model.generate_content(
-        prompt,
-        generation_config=genai.types.GenerationConfig(
-            max_output_tokens=max_tokens,
-            temperature=0.7,
-        )
-    )
+    response = model.generate_content(prompt)
     return response.text
 
 
 def extract_json(text: str) -> dict:
-    # Strip markdown fences if Gemini wraps response in ```json ... ```
+    if not text:
+        return {}
+
+    # Step 1 — strip markdown fences
     text = re.sub(r"```json\s*", "", text)
     text = re.sub(r"```\s*",     "", text)
-    match = re.search(r'\{[\s\S]*\}', text)
-    if match:
+    text = text.strip()
+
+    # Step 2 — try parsing the whole thing directly
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
+    # Step 3 — find the outermost { ... } block
+    start = text.find("{")
+    end   = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
         try:
-            return json.loads(match.group())
+            return json.loads(text[start:end+1])
         except json.JSONDecodeError:
             pass
+
+    # Step 4 — try fixing common issues: trailing commas, unescaped newlines
+    try:
+        cleaned = re.sub(r",\s*([}\]])", r"\1", text[start:end+1])  # remove trailing commas
+        cleaned = re.sub(r"\n",          r"\\n", cleaned)             # escape newlines
+        return json.loads(cleaned)
+    except Exception:
+        pass
+
     return {}
+
+
+def safe_str(val) -> str:
+    """Make sure a value is a plain string"""
+    if isinstance(val, str):
+        return val
+    if isinstance(val, list):
+        return "\n".join(str(v) for v in val)
+    return str(val) if val else ""
 
 
 # ─────────────────────────────────────────────
@@ -225,13 +256,12 @@ def extract_json(text: str) -> dict:
 
 @app.get("/health")
 def health():
-    """Open this URL in browser to confirm backend is alive and keys are set"""
     return {
-        "status":          "ok",
-        "sessions_active": len(sessions),
-        "gemini_key_set":  bool(os.getenv("GEMINI_API_KEY")),
-        "tavily_key_set":  bool(os.getenv("TAVILY_API_KEY")),
-        "password_set":    bool(os.getenv("APP_PASSWORD")),
+        "status":           "ok",
+        "sessions_active":  len(sessions),
+        "gemini_key_set":   bool(os.getenv("GEMINI_API_KEY")),
+        "tavily_key_set":   bool(os.getenv("TAVILY_API_KEY")),
+        "password_set":     bool(os.getenv("APP_PASSWORD")),
     }
 
 
@@ -246,17 +276,14 @@ async def analyze(
     linkedin_file:   Optional[UploadFile] = File(None),
     password:        str                  = Form(...),
 ):
-    # Auth
     if not verify_password(password):
         raise HTTPException(401, "Wrong password. Access denied.")
 
-    # Rate limit
     ip = get_ip(request)
     limited, msg = check_rate_limit(ip)
     if limited:
         raise HTTPException(429, msg)
 
-    # Validate inputs
     company         = sanitize(company,         MAX_FIELD_LENGTH)
     role            = sanitize(role,            MAX_FIELD_LENGTH)
     location        = sanitize(location,        MAX_FIELD_LENGTH)
@@ -267,13 +294,11 @@ async def analyze(
     if len(job_description) < 80:
         raise HTTPException(400, "Job description too short — paste the full JD.")
 
-    # Parse CV
     cv_bytes = await cv_file.read()
     if len(cv_bytes) > MAX_FILE_SIZE:
         raise HTTPException(400, "CV file exceeds 5 MB.")
     cv_text = parse_pdf(cv_bytes, "CV")
 
-    # Parse LinkedIn (optional — failure is non-fatal)
     linkedin_text = ""
     if linkedin_file and linkedin_file.filename:
         li_bytes = await linkedin_file.read()
@@ -283,70 +308,70 @@ async def analyze(
             except HTTPException:
                 linkedin_text = ""
 
-    # Gather intelligence
     request_log[ip].append(time.time())
     intel         = gather_intelligence(company, role, location)
     intel_summary = format_intel(intel)
 
-    # AI Analysis
-    analysis_prompt = f"""You are an expert CV analyst and ATS specialist.
+    analysis_prompt = f"""You are a CV analyst and ATS specialist. Analyse this job application.
 
 COMPANY: {company}
 ROLE: {role}
 LOCATION: {location}
 
 JOB DESCRIPTION:
-{job_description[:3500]}
+{job_description[:2500]}
 
 CANDIDATE CV:
-{cv_text[:3000]}
+{cv_text[:2500]}
 
 LINKEDIN PROFILE:
-{linkedin_text[:2000] if linkedin_text else "Not provided"}
+{linkedin_text[:1500] if linkedin_text else "Not provided"}
 
 MARKET INTELLIGENCE:
-{intel_summary[:2500]}
+{intel_summary[:2000]}
 
-TASKS:
-1. Find ALL gaps and weaknesses (missing keywords, vague achievements, passive voice, no metrics, employment gaps)
-2. Detect AI-generated language — flag these words if found in CV: spearheaded, leveraged, orchestrated, streamlined, pioneered, facilitated, demonstrated, fostered, cultivated, navigated, synergize, dynamic, results-driven, passionate, detail-oriented, proactive
-3. Find LinkedIn vs CV contradictions (dates, titles, companies)
-4. Identify ABC Intersection — items in ATS best practices AND company culture AND role requirements
-5. Extract company-specific recruiter tips from intelligence
-6. Write max 5 targeted questions for info we cannot get from the CV that would change the output
+Return ONLY a JSON object with these exact keys. No text before or after the JSON:
 
-NEVER ask: are you a strong match — useless.
-ALWAYS ask if relevant: employment gap explanations, real metrics, referral at {company}, hidden relevant experience.
-
-IMPORTANT: Reply ONLY with a valid JSON object. No markdown. No code fences. No explanation. Just the raw JSON:
 {{
-  "gaps_found": ["gap1", "gap2"],
-  "ai_words_detected": ["word1"],
-  "auto_fixes": ["Grammar: fixed X", "Spelling: corrected Y"],
-  "linkedin_contradictions": ["issue1"],
-  "abc_intersection": ["item1", "item2"],
+  "gaps_found": ["list gaps and missing keywords here"],
+  "ai_words_detected": ["list any of these words found in CV: spearheaded leveraged orchestrated streamlined pioneered facilitated demonstrated fostered cultivated navigated synergize dynamic results-driven passionate detail-oriented proactive"],
+  "auto_fixes": ["list grammar spelling and passive voice issues found"],
+  "linkedin_contradictions": ["list any date title or company mismatches between LinkedIn and CV"],
+  "abc_intersection": ["list top 3 to 5 items appearing in ATS best practices AND company culture AND role requirements"],
   "questions": [
     {{
       "id": "q1",
-      "question": "question text",
-      "context": "why this matters"
+      "question": "write your question here",
+      "context": "explain why this matters for the CV"
     }}
   ],
   "heads_up_tips": [
     {{
-      "tip": "actionable tip",
+      "tip": "write the tip here",
       "source": "source name",
-      "source_url": "url or empty string",
+      "source_url": "",
       "action_taken": "what we will do in the CV"
     }}
   ]
 }}"""
 
     try:
-        raw      = call_ai(analysis_prompt, max_tokens=2000)
+        raw      = call_ai(analysis_prompt)
         analysis = extract_json(raw)
     except Exception as e:
         raise HTTPException(500, f"AI analysis failed: {str(e)}")
+
+    # If JSON came back empty, use safe defaults so the app doesn't break
+    if not analysis:
+        analysis = {
+            "gaps_found": ["Could not auto-detect gaps — please review manually"],
+            "ai_words_detected": [],
+            "auto_fixes": [],
+            "linkedin_contradictions": [],
+            "abc_intersection": [],
+            "questions": [],
+            "heads_up_tips": [],
+        }
 
     session_id = create_session({
         "company":         company,
@@ -372,7 +397,6 @@ IMPORTANT: Reply ONLY with a valid JSON object. No markdown. No code fences. No 
 
 @app.post("/api/generate")
 async def generate(request: Request, body: dict = Body(...)):
-    # Auth
     if not verify_password(body.get("password", "")):
         raise HTTPException(401, "Wrong password.")
 
@@ -391,87 +415,90 @@ async def generate(request: Request, body: dict = Body(...)):
         if user_answers else "No additional information provided."
     )
 
-    generate_prompt = f"""You are an elite CV writer, ATS specialist, and career strategist.
+    banned = ', '.join(ai_words) if ai_words else "none detected"
 
-COMPANY:  {ctx['company']}
-ROLE:     {ctx['role']}
+    generate_prompt = f"""You are an elite CV writer and career strategist.
+
+COMPANY: {ctx['company']}
+ROLE: {ctx['role']}
 LOCATION: {ctx['location']}
 
 JOB DESCRIPTION:
-{ctx['job_description'][:3500]}
+{ctx['job_description'][:2500]}
 
 ORIGINAL CV:
-{ctx['cv_text']}
+{ctx['cv_text'][:2500]}
 
 LINKEDIN PROFILE:
-{ctx['linkedin_text'] if ctx['linkedin_text'] else "Not provided"}
+{ctx['linkedin_text'][:1500] if ctx['linkedin_text'] else "Not provided"}
 
 MARKET INTELLIGENCE:
-{ctx['intel_summary']}
+{ctx['intel_summary'][:2000]}
 
-ABC INTERSECTION (optimise these first):
+TOP PRIORITIES (ABC intersection):
 {abc}
 
 CANDIDATE ANSWERS:
 {answers_text}
 
-RULES:
+STRICT RULES:
+1. NO tables, columns, text boxes, graphics, icons or photos in CV
+2. Plain text only with standard section headers: Summary, Experience, Education, Skills, Projects
+3. Dates in Mon YYYY format only
+4. BANNED words (remove all): {banned} and also: spearheaded leveraged orchestrated streamlined pioneered synergize dynamic passionate results-driven detail-oriented proactive innovative
+5. Use strong verbs instead: Built Delivered Led Drove Reduced Grew Launched Solved Shipped Improved Designed Implemented Managed Scaled
+6. Achievement-first bullets not responsibility-first
+7. Vary bullet lengths naturally — mix short 8 word lines with longer 25 word lines
+8. Never invent numbers — only use metrics the candidate confirmed
+9. Summary must be specific to THIS company and role — no generic templates
+10. Cover letter Para 1 must reference something specific about THIS company
 
-CV STRUCTURE (non-negotiable):
-- NO tables, NO columns, NO text boxes, NO graphics, NO icons, NO photos
-- Plain text only
-- Section headers: Summary | Experience | Education | Skills | Projects | Certifications
-- Dates: Mon YYYY only (e.g. Jan 2022)
+Return ONLY a JSON object. No text before or after. No markdown fences:
 
-ANTI-AI-DETECTION:
-- BANNED words: {', '.join(ai_words) if ai_words else 'none found — still avoid globally'}
-- Also always avoid: spearheaded, leveraged, orchestrated, streamlined, pioneered, facilitated, demonstrated, fostered, cultivated, navigated, synergize, dynamic, passionate, results-driven, detail-oriented, proactive, innovative
-- Vary bullet lengths naturally — some 8 words, some 25 — never uniform
-- Only use numbers the candidate confirmed are real — never invent percentages
-- No real numbers available? Use specific qualitative detail instead
-- Summary must be specific to THIS role at THIS company — zero templates
-
-GOOD ACTION VERBS: Built, Delivered, Led, Drove, Reduced, Grew, Launched, Solved, Shipped, Cut, Improved, Designed, Implemented, Deployed, Managed, Negotiated, Trained, Established, Resolved, Automated, Scaled
-
-COVER LETTER:
-- Para 1: Specific hook about THIS company — no generic openers ever
-- Para 2: Candidate background matched to their exact need
-- Para 3: One concrete proof example with real detail
-- Para 4: Confident close — not desperate, not arrogant
-
-IMPORTANT: Reply ONLY with a valid JSON object. No markdown. No code fences. No explanation. Just raw JSON:
 {{
-  "cv_ats_version": "complete plain-text ATS optimised CV here",
-  "cv_human_version": "same CV slightly polished for human reading",
-  "cover_letter": "complete cover letter full text",
+  "cv_ats_version": "write the complete plain text ATS CV here as a single string with newlines as \\n",
+  "cv_human_version": "write the same CV slightly polished here as a single string with newlines as \\n",
+  "cover_letter": "write the complete cover letter here as a single string with newlines as \\n",
   "linkedin_tips": [
     {{
-      "section": "section name e.g. Headline",
-      "current_issue": "what is weak or wrong",
-      "recommended_text": "exact replacement text to use",
-      "why": "specific reason tied to this role and company"
+      "section": "Headline",
+      "current_issue": "describe what is weak",
+      "recommended_text": "write exact replacement text",
+      "why": "explain why for this specific role"
     }}
   ],
   "change_log": [
     {{
-      "original": "original text from CV",
-      "changed_to": "new improved text",
-      "reason": "why this change was made"
+      "original": "original text",
+      "changed_to": "new text",
+      "reason": "why"
     }}
   ],
-  "application_strategy": "specific advice on who to contact at this company, how, what to say, and timing"
+  "application_strategy": "write specific advice on who to contact how and when"
 }}"""
 
     try:
-        raw    = call_ai(generate_prompt, max_tokens=4500)
+        raw    = call_ai(generate_prompt)
         result = extract_json(raw)
     except Exception as e:
         raise HTTPException(500, f"CV generation failed: {str(e)}")
 
+    # If JSON extraction failed, build a safe fallback from raw text
     if not result:
-        raise HTTPException(500, "AI returned malformed output. Please try again.")
+        result = {
+            "cv_ats_version":      raw[:3000] if raw else "Generation failed — please try again.",
+            "cv_human_version":    raw[:3000] if raw else "Generation failed — please try again.",
+            "cover_letter":        "Cover letter generation failed — please try again.",
+            "linkedin_tips":       [],
+            "change_log":          [],
+            "application_strategy": "Please try again for strategy tips.",
+        }
 
-    # Delete session immediately after generation — no data left behind
+    # Ensure all text fields are strings not lists
+    for field in ["cv_ats_version", "cv_human_version", "cover_letter", "application_strategy"]:
+        if field in result:
+            result[field] = safe_str(result[field])
+
     sessions.pop(session_id, None)
 
     return {
